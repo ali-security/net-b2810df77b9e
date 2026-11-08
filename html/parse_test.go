@@ -488,3 +488,25 @@ func BenchmarkParser(b *testing.B) {
 		Parse(bytes.NewBuffer(buf))
 	}
 }
+
+func TestDepthLimit(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		input   string
+		succeed bool
+	}{
+		{"above depth limit", strings.Repeat("<dl>", 511), false},
+		{"below depth limit", strings.Repeat("<dl>", 510), true},
+		{"above depth limit, interspersed elements", strings.Repeat("<dl><img />", 511), false},
+		{"closing tags", strings.Repeat("</dl>", 512), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			_, err := Parse(strings.NewReader(tc.input))
+			if tc.succeed && err != nil {
+				t.Errorf("unexpected error: %v", err)
+			} else if !tc.succeed && err == nil {
+				t.Errorf("unexpected success")
+			}
+		})
+	}
+}
