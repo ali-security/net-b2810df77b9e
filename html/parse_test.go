@@ -16,6 +16,7 @@ import (
 	"sort"
 	"strings"
 	"testing"
+	"time"
 
 	"golang.org/x/net/html/atom"
 )
@@ -521,5 +522,95 @@ func TestIssue70179(t *testing.T) {
 	_, err := Parse(strings.NewReader("<table><tbody><svg><td><desc><select></select></tbody>"))
 	if err != nil {
 		t.Fatalf("unexpected failure: %v", err)
+	}
+}
+
+func TestNoahsArkClauseAttributeOrder(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		input string
+		want  int
+	}{
+		// Formatting elements with the same attributes in a different order are
+		// identical, so the Noah's Ark clause keeps only three of them in the
+		// list of active formatting elements.
+		{"reordered attributes", `<p><b x=1 y=2><b y=2 x=1><b x=1 y=2><b y=2 x=1><p>X`, 3},
+		// Formatting elements whose attribute values differ are not identical.
+		{"different attribute values", `<p><b x=1 y=2><b y=3 x=1><b x=1 y=2><b y=3 x=1><p>X`, 4},
+		// Formatting elements with a different number of attributes are not
+		// identical.
+		{"different attribute count", `<p><b x=1><b x=1 y=2><b x=1><b x=1 y=2><p>X`, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			doc, err := Parse(strings.NewReader(tc.input))
+			if err != nil {
+				t.Fatalf("unexpected failure: %v", err)
+			}
+			var paragraphs []*Node
+			var walk func(*Node)
+			walk = func(n *Node) {
+				if n.Type == ElementNode && n.DataAtom == atom.P {
+					paragraphs = append(paragraphs, n)
+				}
+				for c := n.FirstChild; c != nil; c = c.NextSibling {
+					walk(c)
+				}
+			}
+			walk(doc)
+			if len(paragraphs) != 2 {
+				t.Fatalf("got %d <p> elements, want 2", len(paragraphs))
+			}
+			// The active formatting elements are reconstructed, nested, inside
+			// the second paragraph.
+			got := 0
+			for n := paragraphs[1].FirstChild; n != nil && n.Type == ElementNode && n.DataAtom == atom.B; n = n.FirstChild {
+				got++
+			}
+			if got != tc.want {
+				t.Errorf("got %d reconstructed <b> elements, want %d", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestNoahsArkClauseManyAttributes checks that the Noah's Ark clause does not
+// take time quadratic in the number of attributes of the formatting elements it
+// compares. Comparing every attribute of one element against every attribute of
+// the other let a small document with a few formatting elements carrying many
+// attributes keep the parser busy for minutes.
+func TestNoahsArkClauseManyAttributes(t *testing.T) {
+	const (
+		numElements = 16
+		numAttrs    = 40000
+		digits      = "0123456789abcdefghijklmnopqrstuvwxyz"
+	)
+	var attrs strings.Builder
+	for i := 0; i < numAttrs; i++ {
+		attrs.WriteByte(' ')
+		attrs.WriteByte(digits[i/(36*36)])
+		attrs.WriteByte(digits[i/36%36])
+		attrs.WriteByte(digits[i%36])
+	}
+	var buf strings.Builder
+	for i := 0; i < numElements; i++ {
+		// The elements only differ in their last attribute, so a pairwise
+		// comparison looks at almost every pair of attributes before it finds
+		// the mismatch.
+		fmt.Fprintf(&buf, "<b%s id=%d>", attrs.String(), i)
+	}
+	buf.WriteString("X")
+
+	done := make(chan error, 1)
+	go func() {
+		_, err := Parse(strings.NewReader(buf.String()))
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("unexpected failure: %v", err)
+		}
+	case <-time.After(time.Minute):
+		t.Fatalf("parsing %d formatting elements with %d attributes each did not finish within a minute", numElements, numAttrs)
 	}
 }
