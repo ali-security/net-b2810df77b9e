@@ -1886,6 +1886,129 @@ func testTransportResponseHeaderTimeout(t *testing.T, body bool) {
 	}
 }
 
+// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
+// that causes any flow-control window to exceed the maximum size as
+// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
+// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
+func TestTransportSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	body := tc.newRequestBody()
+	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
+	rt := tc.roundTrip(req)
+	tc.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
+	tc.wantIdle()
+
+	// Adjust the initial flow control window. The stream is now over the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize + 1})
+	tc.wantSettingsAck()
+
+	// We detect this condition lazily. Write something to the stream so we notice.
+	body.writeBytes(1)
+	body.closeWithError(io.EOF)
+
+	tc.wantGoAway(0, ErrCodeFlowControl)
+}
+
+// Counterpart to TestTransportSettingsFlowControlUpdateBeyondLimit:
+// A SETTINGS update which doesn't quite put a stream over the flow control limit.
+func TestTransportSettingsFlowControlUpdateWithinLimit(t *testing.T) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	body := tc.newRequestBody()
+	req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
+	rt := tc.roundTrip(req)
+	tc.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	tc.writeWindowUpdate(rt.streamID(), windowIncrease)
+	tc.wantIdle()
+
+	// Adjust the initial flow control window. The stream is just within the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	tc.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
+	tc.wantSettingsAck()
+
+	body.writeBytes(1)
+	body.closeWithError(io.EOF)
+	tc.wantData(wantData{
+		streamID:  1,
+		endStream: true,
+		size:      1,
+		multiple:  true,
+	})
+	tc.wantIdle()
+}
+
+// A server which has many streams open on a connection and then sends many
+// SETTINGS frames containing SETTINGS_INITIAL_WINDOW_SIZE must not make the
+// client walk every open stream for each setting (CVE-2026-78669).
+// Stream send windows are derived from the connection's initial window size,
+// so processing the setting leaves per-stream flow control state untouched.
+func TestTransportSettingsInitialWindowSizeManyStreams(t *testing.T) {
+	tc := newTestClientConn(t)
+	tc.greet()
+
+	const numStreams = 50
+	var bodies []*testRequestBody
+	for i := 0; i < numStreams; i++ {
+		body := tc.newRequestBody()
+		bodies = append(bodies, body)
+		req, _ := http.NewRequest("GET", "https://dummy.tld/", body)
+		tc.roundTrip(req)
+		tc.wantFrameType(FrameHeaders)
+	}
+	tc.wantIdle()
+
+	const numSettings = 200
+	for i := 0; i < numSettings; i++ {
+		tc.writeSettings(Setting{SettingInitialWindowSize, uint32(i)})
+	}
+	for i := 0; i < numSettings; i++ {
+		tc.wantSettingsAck()
+	}
+	tc.wantIdle()
+
+	const lastInitial = numSettings - 1
+	func() {
+		tc.cc.mu.Lock()
+		defer tc.cc.mu.Unlock()
+		if got := len(tc.cc.streams); got != numStreams {
+			t.Fatalf("open streams = %v; want %v", got, numStreams)
+		}
+		if got := tc.cc.flow.initial; got != lastInitial {
+			t.Fatalf("conn initial window = %v; want %v", got, lastInitial)
+		}
+		for id, cs := range tc.cc.streams {
+			if cs.flow.delta != 0 {
+				t.Errorf("stream %v: flow delta = %v after SETTINGS; want 0 (per-stream state untouched)", id, cs.flow.delta)
+			}
+			if avail, ok := cs.flow.available(); !ok || avail != lastInitial {
+				t.Errorf("stream %v: available = %v, %v; want %v, true", id, avail, ok, lastInitial)
+			}
+		}
+	}()
+
+	for _, body := range bodies {
+		body.closeWithError(io.EOF)
+		tc.wantData(wantData{
+			endStream: true,
+			size:      0,
+		})
+	}
+	tc.wantIdle()
+}
+
 func TestTransportDisableCompression(t *testing.T) {
 	const body = "sup"
 	ts := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {

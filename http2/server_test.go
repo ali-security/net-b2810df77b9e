@@ -1325,6 +1325,9 @@ func TestServer_Send_RstStream_After_Bogus_WindowUpdate(t *testing.T) {
 		t.Fatal(err)
 	}
 	st.wantRSTStream(1, ErrCodeFlowControl)
+	// Connection is still alive, even if the stream has been reset.
+	st.writePing(false, [8]byte{})
+	st.wantFrameType(FramePing)
 }
 
 // testServerPostUnblock sends a hanging POST with unsent data to handler,
@@ -4750,4 +4753,141 @@ func TestServerPingResponded(t *testing.T) {
 
 	st.advance(2 * time.Second)
 	st.wantIdle()
+}
+
+// "An endpoint MUST treat a change to SETTINGS_INITIAL_WINDOW_SIZE
+// that causes any flow-control window to exceed the maximum size as
+// a connection error (Section 5.4.1) of type FLOW_CONTROL_ERROR."
+// -- https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9.2-7
+func TestServerSettingsFlowControlUpdateBeyondLimit(t *testing.T) {
+	writeBody := make(chan struct{})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		w.(http.Flusher).Flush()
+		<-writeBody
+		w.Write([]byte("hello"))
+		w.(http.Flusher).Flush()
+	})
+	st.greet()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1, // clients send odd numbers
+		BlockFragment: st.encodeHeader(":method", "POST"),
+		EndStream:     false, // data coming
+		EndHeaders:    true,
+	})
+	st.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	st.writeWindowUpdate(1, windowIncrease)
+	st.wantIdle()
+
+	// Adjust the initial flow control window. The stream is now over the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	st.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize + 1})
+	st.wantSettingsAck()
+
+	// We detect this condition lazily. Write something to the stream so we notice.
+	close(writeBody)
+
+	st.wantGoAway(1, ErrCodeFlowControl)
+}
+
+// Counterpart to TestServerSettingsFlowControlUpdateBeyondLimit:
+// A SETTINGS update which doesn't quite put a stream over the flow control limit.
+func TestServerSettingsFlowControlUpdateWithinLimit(t *testing.T) {
+	writeBody := make(chan struct{})
+	exitHandler := make(chan struct{})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		w.(http.Flusher).Flush()
+		<-writeBody
+		w.Write([]byte("hello"))
+		w.(http.Flusher).Flush()
+		<-exitHandler
+	})
+	defer close(exitHandler)
+	st.greet()
+
+	st.writeHeaders(HeadersFrameParam{
+		StreamID:      1, // clients send odd numbers
+		BlockFragment: st.encodeHeader(":method", "POST"),
+		EndStream:     false, // data coming
+		EndHeaders:    true,
+	})
+	st.wantFrameType(FrameHeaders)
+
+	// Give this stream some additional flow control.
+	const windowIncrease = 1000
+	st.writeWindowUpdate(1, windowIncrease)
+	st.wantIdle()
+
+	// Adjust the initial flow control window. The stream is just within the limit.
+	const maxWindowSize = (1 << 31) - 1 // RFC 9113, 6.9.1
+	const maxInitialWindowSize = maxWindowSize - windowIncrease
+	st.writeSettings(Setting{SettingInitialWindowSize, maxInitialWindowSize})
+	st.wantSettingsAck()
+
+	close(writeBody)
+	st.wantFrameType(FrameData)
+	st.wantIdle()
+}
+
+// A client which opens many streams and then sends many SETTINGS frames
+// containing SETTINGS_INITIAL_WINDOW_SIZE must not make the server walk
+// every open stream for each setting (CVE-2026-78669).
+// Stream send windows are derived from the connection's initial window size,
+// so processing the setting leaves per-stream flow control state untouched.
+func TestServerSettingsInitialWindowSizeManyStreams(t *testing.T) {
+	unblock := make(chan struct{})
+	st := newServerTester(t, func(w http.ResponseWriter, r *http.Request) {
+		<-unblock
+	})
+	defer close(unblock)
+	st.greet()
+
+	const numStreams = 50
+	for i := 0; i < numStreams; i++ {
+		st.writeHeaders(HeadersFrameParam{
+			StreamID:      uint32(2*i + 1), // clients send odd numbers
+			BlockFragment: st.encodeHeader(),
+			EndStream:     true,
+			EndHeaders:    true,
+		})
+	}
+	st.wantIdle()
+
+	const numSettings = 200
+	for i := 0; i < numSettings; i++ {
+		st.writeSettings(Setting{SettingInitialWindowSize, uint32(i)})
+	}
+	for i := 0; i < numSettings; i++ {
+		st.wantSettingsAck()
+	}
+	st.wantIdle()
+
+	const lastInitial = numSettings - 1
+	errc := make(chan error, 1)
+	st.sc.serveMsgCh <- func(int) {
+		errc <- func() error {
+			if got := len(st.sc.streams); got != numStreams {
+				return fmt.Errorf("open streams = %v; want %v", got, numStreams)
+			}
+			if got := st.sc.flow.initial; got != lastInitial {
+				return fmt.Errorf("conn initial window = %v; want %v", got, lastInitial)
+			}
+			for id, s := range st.sc.streams {
+				if s.flow.delta != 0 {
+					return fmt.Errorf("stream %v: flow delta = %v after SETTINGS; want 0 (per-stream state untouched)", id, s.flow.delta)
+				}
+				if avail, ok := s.flow.available(); !ok || avail != lastInitial {
+					return fmt.Errorf("stream %v: available = %v, %v; want %v, true", id, avail, ok, lastInitial)
+				}
+			}
+			return nil
+		}()
+	}
+	if err := <-errc; err != nil {
+		t.Fatal(err)
+	}
 }
