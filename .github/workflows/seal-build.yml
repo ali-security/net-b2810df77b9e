@@ -1,0 +1,146 @@
+# Upstream golang.org/x/net has no GitHub Actions CI (it is tested on the Go
+# project's own TryBot/LUCI infrastructure), so this workflow is written from
+# scratch. It packages the module zip exactly as the module proxy does and runs
+# the project's own test suite (`go test ./...`) on Linux, macOS and Windows.
+name: seal-build
+
+on:
+  workflow_dispatch:
+    inputs:
+      test-filter:
+        description: 'Go package pattern(s) to test instead of ./...'
+        required: false
+        default: ''
+
+permissions:
+  contents: read
+
+jobs:
+  module-zip:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
+      # Build the packaging helper in its own module OUTSIDE the checkout, so
+      # `go get` never touches this repository's go.mod/go.sum.
+      - name: Build module-zip helper
+        run: |
+          set -eux
+          HELPER=$(mktemp -d)
+          cp "$GITHUB_WORKSPACE/.github/create_mod.go" "$HELPER/"
+          cd "$HELPER"
+          go mod init example.com/mod
+          go get golang.org/x/mod@v0.21.0
+          go build -o "$RUNNER_TEMP/create_mod" .
+
+      # golang.org/x/mod/zip skips .git but DESCENDS into .github, so this
+      # workflow would otherwise leak into the zip as extra entries that the
+      # public proxy artifact does not have. .gitignore and .gitattributes are
+      # kept: they ARE part of the published module zip.
+      - name: Create module zip
+        run: |
+          set -eux
+          mkdir -p "$RUNNER_TEMP/out"
+          rm -rf "$GITHUB_WORKSPACE/.github"
+          "$RUNNER_TEMP/create_mod" \
+            golang.org/x/net v0.30.0 \
+            "$GITHUB_WORKSPACE" \
+            "$RUNNER_TEMP/out/v0.30.0.zip"
+          unzip -l "$RUNNER_TEMP/out/v0.30.0.zip" | tail -5
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: module-zip
+          path: ${{ runner.temp }}/out/v0.30.0.zip
+          if-no-files-found: error
+
+  test:
+    name: test (${{ matrix.os }}, go ${{ matrix.go }}${{ matrix.race && ', race' || '' }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Go 1.22: the release-era toolchain (runtime hint for v0.30.0).
+          - os: ubuntu-latest
+            go: '1.22'
+            race: true
+          # Go 1.21 with -race, as the 0.30.0-sp2 CI ran; exercises the
+          # pre-go1.22 build-tagged files.
+          - os: ubuntu-latest
+            go: '1.21'
+            race: true
+          # Go < 1.23 binaries abort on current macOS (missing LC_UUID load
+          # command), so the macOS leg uses Go 1.23.
+          - os: macos-latest
+            go: '1.23'
+            race: false
+          - os: windows-latest
+            go: '1.22'
+            race: false
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        # Windows would otherwise default to pwsh, where `set -eux` fails.
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go }}
+
+      - name: Download and verify dependencies
+        run: |
+          set -eux
+          go mod download
+          go mod verify
+
+      - name: Build
+        run: |
+          set -eux
+          go build -v ./...
+
+      # -v so every test reports its own PASS/FAIL/SKIP line; -count=1 so no
+      # package result is served from the test cache. The exit status of
+      # `go test` is propagated unchanged (pipefail).
+      - name: Test
+        run: |
+          set -euo pipefail
+          go test -v -count=1 ${{ matrix.race && '-race' || '' }} ${{ inputs.test-filter || './...' }} 2>&1 | tee "$RUNNER_TEMP/go-test.log"
+
+      # Prints every package result, every skipped test together with the
+      # t.Skip reason go test logged for it, and the pass/fail/skip counts.
+      - name: Test summary
+        if: always()
+        run: |
+          set -eu
+          awk '
+            { sub(/\r$/, "") }
+            /^=== RUN/ { cur = $3; r[cur] = ""; next }
+            /^=== (CONT|NAME|PAUSE)/ { cur = $3; next }
+            /^[ \t]+[^ \t]+\.go:[0-9]+: / { if (cur != "") { line = $0; sub(/^[ \t]+/, "", line); r[cur] = r[cur] " | " line } }
+            /^(ok|FAIL|\?)[ \t]/ { pk[++np] = $0 }
+            /^ok[ \t]/ { pok++ }
+            /^FAIL[ \t]/ { pfail++ }
+            /^[ \t]*--- PASS/ { pass++ }
+            /^[ \t]*--- FAIL/ { fail++; fl[++nf] = $0 }
+            /^[ \t]*--- SKIP/ { skip++; name = $3; s = $0; sub(/^[ \t]+/, "", s); sk[++ns] = s "  reason:" r[name] }
+            END {
+              print "==== package results ===="
+              for (i = 1; i <= np; i++) print pk[i]
+              print "==== skipped tests (with reasons) ===="
+              for (i = 1; i <= ns; i++) print sk[i]
+              print "==== failed tests ===="
+              for (i = 1; i <= nf; i++) print fl[i]
+              print "==== go test summary ===="
+              printf "packages ok: %d, packages FAIL: %d\n", pok, pfail
+              printf "tests passed: %d, failed: %d, skipped: %d\n", pass, fail, skip
+            }
+          ' "$RUNNER_TEMP/go-test.log"
