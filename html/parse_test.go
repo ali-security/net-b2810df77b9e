@@ -614,3 +614,68 @@ func TestNoahsArkClauseManyAttributes(t *testing.T) {
 		t.Fatalf("parsing %d formatting elements with %d attributes each did not finish within a minute", numElements, numAttrs)
 	}
 }
+
+func TestTextNodeCoalescing(t *testing.T) {
+	const n = 10000
+	for _, tc := range []struct {
+		name  string
+		input string
+	}{
+		{"body", strings.Repeat("a</x>", n)},
+		{"foster", "<table>" + strings.Repeat("a</x>", n)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var m1, m2 runtime.MemStats
+			runtime.GC()
+			runtime.ReadMemStats(&m1)
+			doc, err := Parse(strings.NewReader(tc.input))
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			runtime.ReadMemStats(&m2)
+
+			body := doc.FirstChild.LastChild
+			text := body.FirstChild
+			if text == nil || text.Type != TextNode {
+				t.Fatalf("got first child %v, want TextNode", text)
+			}
+			if len(text.Data) != n {
+				t.Errorf("got text length %d, want %d", len(text.Data), n)
+			}
+
+			// Coalescing n 1-byte text tokens should not require O(n^2) memory.
+			if alloc := m2.TotalAlloc - m1.TotalAlloc; alloc > 5<<20 {
+				t.Errorf("Parse allocated %d bytes, want <= %d", alloc, 5<<20)
+			}
+		})
+	}
+}
+
+func TestTextNodeCoalescingFragment(t *testing.T) {
+	const n = 10000
+	context := &Node{
+		Type:     ElementNode,
+		DataAtom: atom.Div,
+		Data:     atom.Div.String(),
+	}
+	var m1, m2 runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&m1)
+	nodes, err := ParseFragment(strings.NewReader(strings.Repeat("a</x>", n)), context)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	runtime.ReadMemStats(&m2)
+
+	if len(nodes) != 1 || nodes[0].Type != TextNode {
+		t.Fatalf("got %d nodes, want a single TextNode", len(nodes))
+	}
+	if want := strings.Repeat("a", n); nodes[0].Data != want {
+		t.Errorf("got text length %d, want %d", len(nodes[0].Data), n)
+	}
+
+	// Coalescing n 1-byte text tokens should not require O(n^2) memory.
+	if alloc := m2.TotalAlloc - m1.TotalAlloc; alloc > 5<<20 {
+		t.Errorf("ParseFragment allocated %d bytes, want <= %d", alloc, 5<<20)
+	}
+}
