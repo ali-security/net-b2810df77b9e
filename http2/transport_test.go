@@ -5402,6 +5402,20 @@ func TestIssue66763Race(t *testing.T) {
 	<-donec
 }
 
+func TestTransportDoNotHangOnZeroMaxFrameSize(t *testing.T) {
+	tc := newTestClientConn(t)
+	tc.wantFrameType(FrameSettings)
+	tc.wantFrameType(FrameWindowUpdate)
+
+	tc.writeSettings(Setting{ID: SettingMaxFrameSize, Val: 0})
+
+	req, _ := http.NewRequest("POST", "https://dummy.tld/", strings.NewReader("body"))
+	rt := tc.roundTrip(req)
+	if rt.err() == nil {
+		t.Fatalf("expected error for zero max frame size")
+	}
+}
+
 // Issue 67671: Sending a Connection: close request on a Transport with AllowHTTP
 // set caused a the transport to wedge.
 func TestIssue67671(t *testing.T) {
